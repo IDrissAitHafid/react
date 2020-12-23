@@ -40,8 +40,8 @@ import {getClosestInstanceFromNode} from '../client/ReactDOMComponentTree';
 
 import {
   enableLegacyFBSupport,
-  enableEagerRootListeners,
   decoupleUpdatePriorityFromScheduler,
+  enableNewReconciler,
 } from 'shared/ReactFeatureFlags';
 import {
   UserBlockingEvent,
@@ -54,11 +54,27 @@ import {
   flushDiscreteUpdatesIfNeeded,
   discreteUpdates,
 } from './ReactDOMUpdateBatching';
+
 import {
-  InputContinuousLanePriority,
-  getCurrentUpdateLanePriority,
-  setCurrentUpdateLanePriority,
-} from 'react-reconciler/src/ReactFiberLane';
+  InputContinuousLanePriority as InputContinuousLanePriority_old,
+  getCurrentUpdateLanePriority as getCurrentUpdateLanePriority_old,
+  setCurrentUpdateLanePriority as setCurrentUpdateLanePriority_old,
+} from 'react-reconciler/src/ReactFiberLane.old';
+import {
+  InputContinuousLanePriority as InputContinuousLanePriority_new,
+  getCurrentUpdateLanePriority as getCurrentUpdateLanePriority_new,
+  setCurrentUpdateLanePriority as setCurrentUpdateLanePriority_new,
+} from 'react-reconciler/src/ReactFiberLane.new';
+
+const InputContinuousLanePriority = enableNewReconciler
+  ? InputContinuousLanePriority_new
+  : InputContinuousLanePriority_old;
+const getCurrentUpdateLanePriority = enableNewReconciler
+  ? getCurrentUpdateLanePriority_new
+  : getCurrentUpdateLanePriority_old;
+const setCurrentUpdateLanePriority = enableNewReconciler
+  ? setCurrentUpdateLanePriority_new
+  : setCurrentUpdateLanePriority_old;
 
 const {
   unstable_UserBlockingPriority: UserBlockingPriority,
@@ -188,16 +204,14 @@ export function dispatchEvent(
   if (!_enabled) {
     return;
   }
-  let allowReplay = true;
-  if (enableEagerRootListeners) {
-    // TODO: replaying capture phase events is currently broken
-    // because we used to do it during top-level native bubble handlers
-    // but now we use different bubble and capture handlers.
-    // In eager mode, we attach capture listeners early, so we need
-    // to filter them out until we fix the logic to handle them correctly.
-    // This could've been outside the flag but I put it inside to reduce risk.
-    allowReplay = (eventSystemFlags & IS_CAPTURE_PHASE) === 0;
-  }
+
+  // TODO: replaying capture phase events is currently broken
+  // because we used to do it during top-level native bubble handlers
+  // but now we use different bubble and capture handlers.
+  // In eager mode, we attach capture listeners early, so we need
+  // to filter them out until we fix the logic to handle them correctly.
+  const allowReplay = (eventSystemFlags & IS_CAPTURE_PHASE) === 0;
+
   if (
     allowReplay &&
     hasQueuedDiscreteEvents() &&
@@ -255,7 +269,7 @@ export function dispatchEvent(
       return;
     }
     // We need to clear only if we didn't queue because
-    // queueing is accummulative.
+    // queueing is accumulative.
     clearIfContinuousEvent(domEventName, nativeEvent);
   }
 

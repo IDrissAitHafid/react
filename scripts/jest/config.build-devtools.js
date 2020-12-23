@@ -26,6 +26,9 @@ const packages = readdirSync(packagesRoot).filter(dir => {
 // Create a module map to point React packages to the build output
 const moduleNameMapper = {};
 
+moduleNameMapper['react-devtools-feature-flags'] =
+  '<rootDir>/packages/react-devtools-shared/src/config/DevToolsFeatureFlags.default';
+
 // Map packages to bundles
 packages.forEach(name => {
   // Root entry point
@@ -55,6 +58,9 @@ module.exports = Object.assign({}, baseConfig, {
     ),
     require.resolve(
       '../../packages/react-devtools-shared/src/__tests__/storeSerializer.js'
+    ),
+    require.resolve(
+      '../../packages/react-devtools-shared/src/__tests__/treeContextStateSerializer.js'
     ),
   ],
   setupFiles: [

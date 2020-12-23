@@ -13,19 +13,22 @@ import type {
   MutableSourceSubscribeFn,
   ReactContext,
 } from 'shared/ReactTypes';
-import type {Fiber, Dispatcher} from './ReactInternalTypes';
-import type {Lanes, Lane} from './ReactFiberLane';
+import type {Fiber, Dispatcher, HookType} from './ReactInternalTypes';
+import type {Lanes, Lane} from './ReactFiberLane.old';
 import type {HookFlags} from './ReactHookEffectTags';
 import type {ReactPriorityLevel} from './ReactInternalTypes';
 import type {FiberRoot} from './ReactInternalTypes';
 import type {OpaqueIDType} from './ReactFiberHostConfig';
+import type {Cache} from './ReactFiberCacheComponent.old';
 
 import ReactSharedInternals from 'shared/ReactSharedInternals';
 import {
   enableDebugTracing,
   enableSchedulingProfiler,
   enableNewReconciler,
+  enableCache,
   decoupleUpdatePriorityFromScheduler,
+  enableUseRefAccessWarning,
 } from 'shared/ReactFeatureFlags';
 
 import {NoMode, BlockingMode, DebugTracingMode} from './ReactTypeOfMode';
@@ -42,11 +45,13 @@ import {
   setCurrentUpdateLanePriority,
   higherLanePriority,
   DefaultLanePriority,
-} from './ReactFiberLane';
+} from './ReactFiberLane.old';
 import {readContext} from './ReactFiberNewContext.old';
+import {HostRoot, CacheComponent} from './ReactWorkTags';
 import {
   Update as UpdateEffect,
   Passive as PassiveEffect,
+  PassiveStatic as PassiveStaticEffect,
 } from './ReactFiberFlags';
 import {
   HasEffect as HookHasEffect,
@@ -89,6 +94,8 @@ import {
 import {getIsRendering} from './ReactCurrentFiber';
 import {logStateUpdateScheduled} from './DebugTracing';
 import {markStateUpdateScheduled} from './SchedulingProfiler';
+import {CacheContext} from './ReactFiberCacheComponent.old';
+import {createUpdate, enqueueUpdate} from './ReactUpdateQueue.old';
 
 const {ReactCurrentDispatcher, ReactCurrentBatchConfig} = ReactSharedInternals;
 
@@ -107,22 +114,6 @@ type UpdateQueue<S, A> = {|
   lastRenderedReducer: ((S, A) => S) | null,
   lastRenderedState: S | null,
 |};
-
-export type HookType =
-  | 'useState'
-  | 'useReducer'
-  | 'useContext'
-  | 'useRef'
-  | 'useEffect'
-  | 'useLayoutEffect'
-  | 'useCallback'
-  | 'useMemo'
-  | 'useImperativeHandle'
-  | 'useDebugValue'
-  | 'useDeferredValue'
-  | 'useTransition'
-  | 'useMutableSource'
-  | 'useOpaqueIdentifier';
 
 let didWarnAboutMismatchedHooksForComponent;
 let didWarnAboutUseOpaqueIdentifier;
@@ -1175,14 +1166,92 @@ function pushEffect(tag, create, destroy, deps) {
   return effect;
 }
 
+let stackContainsErrorMessage: boolean | null = null;
+
+function getCallerStackFrame(): string {
+  const stackFrames = new Error('Error message').stack.split('\n');
+
+  // Some browsers (e.g. Chrome) include the error message in the stack
+  // but others (e.g. Firefox) do not.
+  if (stackContainsErrorMessage === null) {
+    stackContainsErrorMessage = stackFrames[0].includes('Error message');
+  }
+
+  return stackContainsErrorMessage
+    ? stackFrames.slice(3, 4).join('\n')
+    : stackFrames.slice(2, 3).join('\n');
+}
+
 function mountRef<T>(initialValue: T): {|current: T|} {
   const hook = mountWorkInProgressHook();
-  const ref = {current: initialValue};
-  if (__DEV__) {
-    Object.seal(ref);
+  if (enableUseRefAccessWarning) {
+    if (__DEV__) {
+      // Support lazy initialization pattern shown in docs.
+      // We need to store the caller stack frame so that we don't warn on subsequent renders.
+      let hasBeenInitialized = initialValue != null;
+      let lazyInitGetterStack = null;
+      let didCheckForLazyInit = false;
+
+      // Only warn once per component+hook.
+      let didWarnAboutRead = false;
+      let didWarnAboutWrite = false;
+
+      let current = initialValue;
+      const ref = {
+        get current() {
+          if (!hasBeenInitialized) {
+            didCheckForLazyInit = true;
+            lazyInitGetterStack = getCallerStackFrame();
+          } else if (currentlyRenderingFiber !== null && !didWarnAboutRead) {
+            if (
+              lazyInitGetterStack === null ||
+              lazyInitGetterStack !== getCallerStackFrame()
+            ) {
+              didWarnAboutRead = true;
+              console.warn(
+                '%s: Unsafe read of a mutable value during render.\n\n' +
+                  'Reading from a ref during render is only safe if:\n' +
+                  '1. The ref value has not been updated, or\n' +
+                  '2. The ref holds a lazily-initialized value that is only set once.\n',
+                getComponentName(currentlyRenderingFiber.type) || 'Unknown',
+              );
+            }
+          }
+          return current;
+        },
+        set current(value) {
+          if (currentlyRenderingFiber !== null && !didWarnAboutWrite) {
+            if (
+              hasBeenInitialized ||
+              (!hasBeenInitialized && !didCheckForLazyInit)
+            ) {
+              didWarnAboutWrite = true;
+              console.warn(
+                '%s: Unsafe write of a mutable value during render.\n\n' +
+                  'Writing to a ref during render is only safe if the ref holds ' +
+                  'a lazily-initialized value that is only set once.\n',
+                getComponentName(currentlyRenderingFiber.type) || 'Unknown',
+              );
+            }
+          }
+
+          hasBeenInitialized = true;
+          current = value;
+        },
+      };
+      Object.seal(ref);
+      hook.memoizedState = ref;
+      return ref;
+    } else {
+      const ref = {current: initialValue};
+      hook.memoizedState = ref;
+      return ref;
+    }
+  } else {
+    const ref = {current: initialValue};
+    hook.memoizedState = ref;
+    return ref;
   }
-  hook.memoizedState = ref;
-  return ref;
 }
 
 function updateRef<T>(initialValue: T): {|current: T|} {
@@ -1240,7 +1309,7 @@ function mountEffect(
     }
   }
   return mountEffectImpl(
-    UpdateEffect | PassiveEffect,
+    UpdateEffect | PassiveEffect | PassiveStaticEffect,
     HookPassive,
     create,
     deps,
@@ -1534,24 +1603,24 @@ function startTransition(setPending, callback) {
 
 function mountTransition(): [(() => void) => void, boolean] {
   const [isPending, setPending] = mountState(false);
-  // The `start` method can be stored on a ref, since `setPending`
-  // never changes.
+  // The `start` method never changes.
   const start = startTransition.bind(null, setPending);
-  mountRef(start);
+  const hook = mountWorkInProgressHook();
+  hook.memoizedState = start;
   return [start, isPending];
 }
 
 function updateTransition(): [(() => void) => void, boolean] {
   const [isPending] = updateState(false);
-  const startRef = updateRef();
-  const start: (() => void) => void = (startRef.current: any);
+  const hook = updateWorkInProgressHook();
+  const start = hook.memoizedState;
   return [start, isPending];
 }
 
 function rerenderTransition(): [(() => void) => void, boolean] {
   const [isPending] = rerenderState(false);
-  const startRef = updateRef();
-  const start: (() => void) => void = (startRef.current: any);
+  const hook = updateWorkInProgressHook();
+  const start = hook.memoizedState;
   return [start, isPending];
 }
 
@@ -1640,6 +1709,55 @@ function updateOpaqueIdentifier(): OpaqueIDType | void {
 function rerenderOpaqueIdentifier(): OpaqueIDType | void {
   const id = rerenderState(undefined)[0];
   return id;
+}
+
+function mountRefresh() {
+  const hook = mountWorkInProgressHook();
+  const refresh = (hook.memoizedState = refreshCache.bind(
+    null,
+    currentlyRenderingFiber,
+  ));
+  return refresh;
+}
+
+function updateRefresh() {
+  const hook = updateWorkInProgressHook();
+  return hook.memoizedState;
+}
+
+function refreshCache<T>(fiber: Fiber, seedKey: ?() => T, seedValue: T) {
+  // TODO: Does Cache work in legacy mode? Should decide and write a test.
+  // TODO: Consider warning if the refresh is at discrete priority, or if we
+  // otherwise suspect that it wasn't batched properly.
+  let provider = fiber.return;
+  while (provider !== null) {
+    switch (provider.tag) {
+      case CacheComponent:
+      case HostRoot: {
+        const lane = requestUpdateLane(provider);
+        const eventTime = requestEventTime();
+        const root = scheduleUpdateOnFiber(provider, lane, eventTime);
+
+        const seededCache = new Map();
+        if (seedKey !== null && seedKey !== undefined && root !== null) {
+          // Seed the cache with the value passed by the caller. This could be
+          // from a server mutation, or it could be a streaming response.
+          seededCache.set(seedKey, seedValue);
+        }
+
+        // Schedule an update on the cache boundary to trigger a refresh.
+        const refreshUpdate = createUpdate(eventTime, lane);
+        const payload = {
+          cache: seededCache,
+        };
+        refreshUpdate.payload = payload;
+        enqueueUpdate(provider, refreshUpdate);
+        return;
+      }
+    }
+    provider = provider.return;
+  }
+  // TODO: Warn if unmounted?
 }
 
 function dispatchAction<S, A>(
@@ -1752,6 +1870,19 @@ function dispatchAction<S, A>(
   }
 }
 
+function getCacheForType<T>(resourceType: () => T): T {
+  if (!enableCache) {
+    invariant(false, 'Not implemented.');
+  }
+  const cache: Cache = readContext(CacheContext);
+  let cacheForType: T | void = (cache.get(resourceType): any);
+  if (cacheForType === undefined) {
+    cacheForType = resourceType();
+    cache.set(resourceType, cacheForType);
+  }
+  return cacheForType;
+}
+
 export const ContextOnlyDispatcher: Dispatcher = {
   readContext,
 
@@ -1772,6 +1903,10 @@ export const ContextOnlyDispatcher: Dispatcher = {
 
   unstable_isNewReconciler: enableNewReconciler,
 };
+if (enableCache) {
+  (ContextOnlyDispatcher: Dispatcher).getCacheForType = getCacheForType;
+  (ContextOnlyDispatcher: Dispatcher).useCacheRefresh = throwInvalidHookError;
+}
 
 const HooksDispatcherOnMount: Dispatcher = {
   readContext,
@@ -1793,6 +1928,10 @@ const HooksDispatcherOnMount: Dispatcher = {
 
   unstable_isNewReconciler: enableNewReconciler,
 };
+if (enableCache) {
+  (HooksDispatcherOnMount: Dispatcher).getCacheForType = getCacheForType;
+  (HooksDispatcherOnMount: Dispatcher).useCacheRefresh = mountRefresh;
+}
 
 const HooksDispatcherOnUpdate: Dispatcher = {
   readContext,
@@ -1814,6 +1953,10 @@ const HooksDispatcherOnUpdate: Dispatcher = {
 
   unstable_isNewReconciler: enableNewReconciler,
 };
+if (enableCache) {
+  (HooksDispatcherOnUpdate: Dispatcher).getCacheForType = getCacheForType;
+  (HooksDispatcherOnUpdate: Dispatcher).useCacheRefresh = updateRefresh;
+}
 
 const HooksDispatcherOnRerender: Dispatcher = {
   readContext,
@@ -1835,6 +1978,10 @@ const HooksDispatcherOnRerender: Dispatcher = {
 
   unstable_isNewReconciler: enableNewReconciler,
 };
+if (enableCache) {
+  (HooksDispatcherOnRerender: Dispatcher).getCacheForType = getCacheForType;
+  (HooksDispatcherOnRerender: Dispatcher).useCacheRefresh = updateRefresh;
+}
 
 let HooksDispatcherOnMountInDEV: Dispatcher | null = null;
 let HooksDispatcherOnMountWithHookTypesInDEV: Dispatcher | null = null;
@@ -1989,6 +2136,14 @@ if (__DEV__) {
 
     unstable_isNewReconciler: enableNewReconciler,
   };
+  if (enableCache) {
+    (HooksDispatcherOnMountInDEV: Dispatcher).getCacheForType = getCacheForType;
+    (HooksDispatcherOnMountInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
+      currentHookNameInDev = 'useCacheRefresh';
+      mountHookTypesDev();
+      return mountRefresh();
+    };
+  }
 
   HooksDispatcherOnMountWithHookTypesInDEV = {
     readContext<T>(
@@ -2111,6 +2266,14 @@ if (__DEV__) {
 
     unstable_isNewReconciler: enableNewReconciler,
   };
+  if (enableCache) {
+    (HooksDispatcherOnMountWithHookTypesInDEV: Dispatcher).getCacheForType = getCacheForType;
+    (HooksDispatcherOnMountWithHookTypesInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
+      currentHookNameInDev = 'useCacheRefresh';
+      updateHookTypesDev();
+      return mountRefresh();
+    };
+  }
 
   HooksDispatcherOnUpdateInDEV = {
     readContext<T>(
@@ -2233,6 +2396,14 @@ if (__DEV__) {
 
     unstable_isNewReconciler: enableNewReconciler,
   };
+  if (enableCache) {
+    (HooksDispatcherOnUpdateInDEV: Dispatcher).getCacheForType = getCacheForType;
+    (HooksDispatcherOnUpdateInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
+      currentHookNameInDev = 'useCacheRefresh';
+      updateHookTypesDev();
+      return updateRefresh();
+    };
+  }
 
   HooksDispatcherOnRerenderInDEV = {
     readContext<T>(
@@ -2356,6 +2527,14 @@ if (__DEV__) {
 
     unstable_isNewReconciler: enableNewReconciler,
   };
+  if (enableCache) {
+    (HooksDispatcherOnRerenderInDEV: Dispatcher).getCacheForType = getCacheForType;
+    (HooksDispatcherOnRerenderInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
+      currentHookNameInDev = 'useCacheRefresh';
+      updateHookTypesDev();
+      return updateRefresh();
+    };
+  }
 
   InvalidNestedHooksDispatcherOnMountInDEV = {
     readContext<T>(
@@ -2493,6 +2672,14 @@ if (__DEV__) {
 
     unstable_isNewReconciler: enableNewReconciler,
   };
+  if (enableCache) {
+    (InvalidNestedHooksDispatcherOnMountInDEV: Dispatcher).getCacheForType = getCacheForType;
+    (InvalidNestedHooksDispatcherOnMountInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
+      currentHookNameInDev = 'useCacheRefresh';
+      updateHookTypesDev();
+      return mountRefresh();
+    };
+  }
 
   InvalidNestedHooksDispatcherOnUpdateInDEV = {
     readContext<T>(
@@ -2630,6 +2817,14 @@ if (__DEV__) {
 
     unstable_isNewReconciler: enableNewReconciler,
   };
+  if (enableCache) {
+    (InvalidNestedHooksDispatcherOnUpdateInDEV: Dispatcher).getCacheForType = getCacheForType;
+    (InvalidNestedHooksDispatcherOnUpdateInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
+      currentHookNameInDev = 'useCacheRefresh';
+      updateHookTypesDev();
+      return updateRefresh();
+    };
+  }
 
   InvalidNestedHooksDispatcherOnRerenderInDEV = {
     readContext<T>(
@@ -2768,4 +2963,12 @@ if (__DEV__) {
 
     unstable_isNewReconciler: enableNewReconciler,
   };
+  if (enableCache) {
+    (InvalidNestedHooksDispatcherOnRerenderInDEV: Dispatcher).getCacheForType = getCacheForType;
+    (InvalidNestedHooksDispatcherOnRerenderInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
+      currentHookNameInDev = 'useCacheRefresh';
+      updateHookTypesDev();
+      return updateRefresh();
+    };
+  }
 }
